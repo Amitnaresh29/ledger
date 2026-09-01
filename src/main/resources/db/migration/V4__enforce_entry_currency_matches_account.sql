@@ -1,0 +1,2 @@
+ALTER TABLE accounts ADD CONSTRAINT accounts_id_currency_unique UNIQUE(id,currency);
+ALTER TABLE ledger_entries ADD CONSTRAINT accounts_id_foreign_key_constraint FOREIGN KEY(account_id,currency) REFERENCES accounts(id,currency);
