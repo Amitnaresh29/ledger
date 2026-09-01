@@ -1,0 +1,95 @@
+<?xml version="1.0" encoding="UTF-8"?>
+  <project xmlns="http://maven.apache.org/POM/4.0.0"
+           xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+           xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+      <modelVersion>4.0.0</modelVersion>
+
+      <!-- inherit tested versions for ~300 libraries -->
+      <parent>
+          <groupId>org.springframework.boot</groupId>
+          <artifactId>spring-boot-starter-parent</artifactId>
+          <version>3.5.16</version>
+          <relativePath/>
+      </parent>
+
+      <!-- who this project is -->
+      <groupId>com.ledger</groupId>
+      <artifactId>ledger</artifactId>
+      <version>0.0.1-SNAPSHOT</version>
+      <name>ledger</name>
+
+      <properties>
+          <java.version>21</java.version>
+      </properties>
+
+      <dependencies>
+      <!-- REST controllers, embedded Tomcat -->
+      <dependency>
+          <groupId>org.springframework.boot</groupId>
+          <artifactId>spring-boot-starter-web</artifactId>
+      </dependency>
+      <!-- JPA/Hibernate + transaction management -->
+      <dependency>
+          <groupId>org.springframework.boot</groupId>
+          <artifactId>spring-boot-starter-data-jpa</artifactId>
+      </dependency>
+      <!-- @Valid on request bodies -->
+      <dependency>
+          <groupId>org.springframework.boot</groupId>
+          <artifactId>spring-boot-starter-validation</artifactId>
+      </dependency>
+      <!-- /actuator/health, metrics -->
+      <dependency>
+          <groupId>org.springframework.boot</groupId>
+          <artifactId>spring-boot-starter-actuator</artifactId>
+      </dependency>
+      <!-- schema migrations -->
+      <dependency>
+          <groupId>org.flywaydb</groupId>
+          <artifactId>flyway-core</artifactId>
+      </dependency>
+      <!-- Flyway's Postgres module (separate since Flyway 10) -->
+      <dependency>
+          <groupId>org.flywaydb</groupId>
+          <artifactId>flyway-database-postgresql</artifactId>
+      </dependency>
+      <!-- JDBC driver: loaded by name at runtime, never imported -->
+      <dependency>
+          <groupId>org.postgresql</groupId>
+          <artifactId>postgresql</artifactId>
+          <scope>runtime</scope>
+      </dependency>
+      <!-- JUnit 5, AssertJ, Mockito, MockMvc -->
+      <dependency>
+          <groupId>org.springframework.boot</groupId>
+          <artifactId>spring-boot-starter-test</artifactId>
+          <scope>test</scope>
+      </dependency>
+      <!-- wires a container into Spring's test context -->
+      <dependency>
+          <groupId>org.springframework.boot</groupId>
+          <artifactId>spring-boot-testcontainers</artifactId>
+          <scope>test</scope>
+      </dependency>
+      <dependency>
+          <groupId>org.testcontainers</groupId>
+          <artifactId>junit-jupiter</artifactId>
+          <scope>test</scope>
+      </dependency>
+      <!-- spins up a real Postgres in Docker for tests -->
+      <dependency>
+          <groupId>org.testcontainers</groupId>
+          <artifactId>postgresql</artifactId>
+          <scope>test</scope>
+      </dependency>
+  </dependencies>
+
+      <build>
+          <plugins>
+              <plugin>
+                  <groupId>org.springframework.boot</groupId>
+                  <artifactId>spring-boot-maven-plugin</artifactId>
+              </plugin>
+          </plugins>
+      </build>
+  </project>

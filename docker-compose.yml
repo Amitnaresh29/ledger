@@ -1,0 +1,21 @@
+
+  services:
+    postgres:
+      image: postgres:17          # pinned major; inside Flyway 11.7.2's tested matrix
+      container_name: ledger-postgres
+      environment:
+        POSTGRES_DB: ledger       # creates this db on first start
+        POSTGRES_USER: ledger
+        POSTGRES_PASSWORD: ledger # fine for local dev; never commit real secrets
+      ports:
+        - "5433:5432"             # host:container - 5433 avoids your local Postgres
+      volumes:
+        - ledger-pgdata:/var/lib/postgresql/data   # PG17 convention; data survives container removal
+      healthcheck:
+        test: ["CMD-SHELL", "pg_isready -U ledger -d ledger"]
+        interval: 5s
+        timeout: 5s
+        retries: 10
+
+  volumes:
+    ledger-pgdata:
