@@ -245,3 +245,392 @@ version | description     | success
    zero — **cannot be a `CHECK` constraint**, because `CHECK` sees one row and this spans rows.
    Options are application-level enforcement inside a transaction, a deferred constraint trigger, or
    a constrained summary table. This is the heart of the project and the best interview material in it.
+
+---
+
+## Day 2 — 2026-09-01
+
+### Status: schema complete, first two entities mapped
+
+Migrations V2, V3 and V4 written, applied and constraint-tested. Repo published to personal GitHub.
+`Account` and `LedgerTransaction` entities validating against the live schema.
+
+---
+
+### `V2__add_accounts_owner_index.sql`
+
+```sql
+CREATE INDEX idx_accounts_owner_id ON accounts (owner_id);
+```
+
+One statement. The primary key auto-created an index on `id`, but `owner_id` had none — and
+"all accounts for this user" is the most common query in the system, so without it Postgres scans
+the whole table.
+
+**The real lesson was why this is a new file.** V1 had already run and Flyway stored its checksum
+(`1541115370`). Editing V1 to add the index would make startup fail. **A forgotten index is always
+added forward.** Confirmed by deliberately triggering the checksum error, then reverting.
+
+*(Production would use `CREATE INDEX CONCURRENTLY` to avoid locking writes, but that cannot run
+inside a transaction, which is how Flyway runs migrations. Needs special handling — later.)*
+
+---
+
+### `V3__create_transactions_and_entries.sql` — the ledger core
+
+**Order matters inside the file:** `ledger_entries` references `transactions`, so `transactions` is
+created first.
+
+| lines | what it does |
+|---|---|
+| 1&ndash;6 | `transactions` — one business event. |
+| 3 | `idempotency_key TEXT NOT NULL UNIQUE` — **the most important column in the schema.** The client sends a key; `UNIQUE` means a retried request cannot post the money twice. Enforced by the database, so it holds even when duplicate requests arrive simultaneously on different threads — which application-level "check then insert" can never guarantee. |
+| 1&ndash;6 | **No `status`, no `updated_at`** — deliberate. The journal is append-only: a transfer either posts completely or leaves no trace, and a reversal is a *new* compensating transaction. You never `UPDATE` or `DELETE` a ledger row. |
+| 9 | `transaction_id UUID NOT NULL REFERENCES transactions(id)` — groups the lines that must sum to zero. |
+| 10 | `account_id UUID NOT NULL REFERENCES accounts(id)` |
+| 11 | `amount BIGINT NOT NULL` — signed, in **minor units**. `50000` = ₹500.00. Negative is money out. |
+| 12 | `currency CHAR(3) NOT NULL` |
+| 15&ndash;16 | `CHECK (amount != 0)` — a zero-amount entry is meaningless noise in a journal. (`!=` and `<>` are identical in Postgres; `<>` is the SQL standard spelling.) |
+| 18&ndash;19 | `CHECK (currency ~ '^[A-Z]{3}$')` |
+| 21&ndash;22 | Indexes on `account_id` (every balance query is `SUM(amount) WHERE account_id = ?` — the hottest index in the system) and `transaction_id`. **Neither foreign key gets an index automatically** — Postgres indexes the *referenced* side (the primary key), never the referencing side. Forgetting this is one of the most common real-world Postgres performance bugs. |
+
+#### Two bugs caught before this was applied
+
+**1. `CHECK (amount >= 0)` instead of `!= 0`.** This would have broken double-entry completely.
+With every amount forced ≥ 0 and zero illegal, every transaction sums to a positive number, so the
+books can never balance — and money leaving an account becomes unrecordable. `>= 0` and `!= 0` sound
+similar and are opposites in effect.
+
+**2. `currency CHAR(3)` with no `NOT NULL`.** The subtle one: **a `CHECK` constraint does not reject
+`NULL`.** A `CHECK` rejects a row only when its expression evaluates to `false`; `NULL ~ '^[A-Z]{3}$'`
+evaluates to `NULL` ("unknown"), so the row is **accepted**. Verified empirically with a temp table.
+The rule: **`CHECK` constrains values, `NOT NULL` constrains absence — they are not redundant.**
+This is three-valued logic, and a favourite interview question.
+
+Both were fixable in place because V3 had not yet run. Timing luck; the checksum rule is unforgiving.
+
+---
+
+### `V4__enforce_entry_currency_matches_account.sql` — the composite FK trick
+
+```sql
+ALTER TABLE accounts ADD CONSTRAINT accounts_id_currency_unique UNIQUE(id,currency);
+ALTER TABLE ledger_entries ADD CONSTRAINT accounts_id_foreign_key_constraint
+    FOREIGN KEY(account_id,currency) REFERENCES accounts(id,currency);
+```
+
+**The problem:** nothing stopped a `USD` entry landing on an `INR` account. Demonstrated the damage —
+one bad row and the transaction summed to `100` instead of `0`, and it wasn't even fixable by
+arithmetic, since 100 US cents and 50000 paise aren't addable quantities. One row makes a transaction
+unauditable.
+
+This **cannot** be a `CHECK` — it spans two tables. The obvious instinct is a trigger. **A trigger is
+not needed.**
+
+| line | what it does |
+|---|---|
+| 1 | `UNIQUE (id, currency)` on `accounts`. Looks pointless, since `id` is already the primary key — it exists purely because **a foreign key can only reference columns carrying a unique or primary-key constraint.** A normal, accepted pattern, not a hack. |
+| 2 | Composite FK on `(account_id, currency)` → `accounts (id, currency)`. Now an entry can only exist if that exact **(account, currency) pair** is present in `accounts`. |
+
+**Verified after applying:**
+- balanced INR transfer → **succeeded**, 2 entries, sums to 0
+- `USD` entry on an INR account → **refused**
+- `UPDATE accounts SET currency='USD'` on an account with entries → **refused**
+
+**That third result was a free bonus and it's the best part.** Once entries exist against an INR
+account, nobody can re-denominate that account — not a stray `UPDATE`, not a migration, not a
+panicking developer at 2am. Silently changing an account's currency under existing entries would
+corrupt every historical balance irrecoverably. One composite foreign key bought both guarantees,
+declaratively.
+
+#### Two bugs caught before this was applied
+
+**1. `FOREIGN KEY(id, currency)` instead of `(account_id, currency)`.** Proven by applying the exact
+V4 inside a `BEGIN … ROLLBACK` and watching a valid insert fail:
+`Key (id, currency)=(44444444-…, INR) is not present in table "accounts"` — that UUID being the
+*entry's own primary key*. The rule: in a foreign key, the columns in `FOREIGN KEY (…)` are local
+columns on the referencing table, and you must name the one **holding the pointer**, not the row's own
+identity. As written, every insert would have failed and the intended rule wasn't enforced at all.
+
+**2. `account_idid`** — `account_` got inserted in front of the existing `id` rather than replacing it.
+`ERROR: column "account_idid" referenced in foreign key constraint does not exist`.
+
+**Naming note:** the constraint is still called `accounts_id_foreign_key_constraint` while living on
+`ledger_entries`, which is misleading — the error message reads
+`violates foreign key constraint "accounts_id_foreign_key_constraint" on table "ledger_entries"` and
+would send a reader to the wrong table. Not worth a V5 to rename, but it demonstrates why the
+`<table>_<columns>_fkey` convention exists: **the constraint name IS the error message.**
+
+---
+
+### Git and GitHub
+
+**`.gitignore`** (created before the first commit, which is the only safe time):
+
+| entry | why |
+|---|---|
+| `target/` | Compiled output, regenerated by every build. Committing it adds churn and merge conflicts for zero value. |
+| `.idea/ *.iml .vscode/ .kiro/ .classpath .project .settings/` | Per-machine editor state — layouts, caches, absolute paths. |
+| `.DS_Store Thumbs.db` | OS file-manager droppings. |
+| `*.log` | Runtime logs. |
+| `.env`, `application-local.properties` | **The habit that matters.** Real credentials never enter a repo, and the ignore exists from day one so you're never one `git add .` away from publishing a password. |
+
+**`mvnw` and `.mvn/` are deliberately NOT ignored** — committing the Maven wrapper is how someone
+cloning the repo builds with Maven 3.9.16 without installing Maven at all. Beginners often ignore
+these; don't.
+
+**Repo-local git identity.** The machine's global config is a work identity
+(`amit.mandaliya@vernost.com`). Set per-repository, with no `--global`, so company work is
+unaffected:
+
+```bash
+git config user.name "Amitnaresh29"
+git config user.email "amit.nm@somaiya.edu"
+```
+
+This matters because **GitHub attributes commits by email** — the wrong address means the work never
+appears as yours and the contribution graph stays empty, which defeats the purpose of a resume
+project. It also keeps a company email off a personal repo.
+
+Pushed to `https://github.com/Amitnaresh29/ledger.git`. Commit `4725d9d` (foundation), then
+`ee2003e` (V3 + V4). Branch is still `master`; GitHub's convention is `main` — optional rename
+pending.
+
+---
+
+### `Account.java` — the first JPA entity
+
+`src/main/java/com/ledger/account/Account.java`
+
+| line group | what it does |
+|---|---|
+| `package` / imports | **`jakarta.persistence`, not `javax.persistence`.** Spring Boot 3 moved to the Jakarta namespace; every pre-2023 tutorial says `javax` and will not compile. |
+| `@Entity` | "this class maps to a table" |
+| `@Table(name = "accounts")` | **Required.** Without it Hibernate derives the table name from the class name via `CamelCaseToUnderscoresNamingStrategy`. |
+| `@Id private UUID id` | **No `@GeneratedValue`** — the application generates ids, matching the schema decision. |
+| `@Column(name = "account_type", nullable = false)` | camelCase field → snake_case column, stated explicitly. |
+| `@JdbcTypeCode(SqlTypes.CHAR)` on `currency` | The DB column is `CHAR(3)` (Postgres `bpchar`), but Hibernate maps `String` to `varchar` by default. Without this, startup fails — see the lesson below. |
+| `createdAt` with `insertable = false, updatable = false` | Tells Hibernate to leave the column out of the `INSERT` so the database's `DEFAULT now()` applies; never updated because it never changes. |
+| `protected Account() {}` | **JPA requires a no-arg constructor** — Hibernate creates a blank instance and populates fields reflectively; it cannot know which constructor argument maps to which column. `protected` and not `public` because a no-arg `Account()` has every field null, i.e. an invalid object; `protected` is the smallest visibility Hibernate can still use (the JPA spec requires public or protected, and lazy-loading proxies are generated subclasses, which cannot call a private constructor). The visibility is documentation enforced by the compiler: *this exists for the framework, not for you.* |
+| `public Account(id, accountType, ownerId, currency)` | The only way application code creates an Account. Demands every required field, so **an invalid Account cannot be constructed.** Does not take `createdAt`. |
+| getters only, no setters | An account's currency and owner must never change after creation — and V4's composite FK enforces the same promise in the database. The Java and the SQL make the same guarantee. |
+
+**`nullable = false` is documentation, not enforcement.** The real `NOT NULL` lives in the migration.
+The annotation is what `ddl-auto=validate` compares against.
+
+---
+
+### `LedgerTransaction.java`
+
+Named `LedgerTransaction`, not `Transaction`, because `jakarta.transaction.Transaction` and Spring's
+`@Transactional` machinery make a bare `Transaction` genuinely confusing to read.
+
+Fields: `id`, `idempotencyKey`, `description`, `createdAt`. Same constructor pattern as `Account`.
+
+#### Bug: "Return type for the method is missing"
+
+```java
+public class LedgerTransaction { ... }
+public ledgerTransaction(UUID id, ...)     // lowercase l
+```
+
+**A constructor's name must match the class name exactly, and Java is case-sensitive.**
+`ledgerTransaction` ≠ `LedgerTransaction`, so the compiler saw a **method declaration** — and methods
+need a return type. That is precisely what the error says; it never considered it a constructor.
+
+Two rules that must hold together:
+1. Constructor name is identical to the class name, character for character.
+2. Constructors have **no return type** — not `void`, not anything.
+
+And the trap that follows: `protected void ledgerTransaction(){}` **compiles cleanly** and is a
+perfectly legal method that merely resembles a constructor. So the class had *zero* real constructors
+while showing only one error.
+
+Also fixed: missing `@Table(name = "transactions")` (Hibernate would have looked for
+`ledger_transaction`); `createdAt` accepted as a constructor argument then silently discarded because
+`insertable = false`; getters named `getidempotencyKey` / `getdescription` instead of
+`getIdempotencyKey` / `getDescription`. Hibernate uses **field access** here (the `@Id` is on a field,
+not a getter) so persistence was unaffected — but Jackson derives JSON property names from getters,
+and `java.beans.Introspector` doesn't recognise a lowercase letter right after `get` as a property
+accessor.
+
+---
+
+### Lessons from Day 2
+
+1. **`LedgerApplication.java` was accidentally deleted** — almost certainly an IDE *Rename* instead of
+   *New File*, since `LedgerTransaction.java` ended up in the folder the main class had occupied. The
+   app failed with `Unable to find a suitable main class`. Recovered with one command:
+   `git restore src/main/java/com/ledger/LedgerApplication.java`. The morning's commit paid for itself
+   within hours. **Commit at every working state, not when a feature is "finished".**
+2. **`ddl-auto=validate` proved itself twice in one session** — it would have caught the missing
+   `@Table`, and it *did* catch a wrong column type, naming the exact column and both types.
+3. **A `CHECK` constraint does not reject `NULL`.** See V3 above.
+4. **`>= 0` vs `!= 0`** — read constraint operators as carefully as code.
+5. **In a foreign key, name the column holding the pointer**, not the row's own id.
+
+---
+
+## Day 3 — 2026-09-02
+
+### Status: all three entities validating against the schema
+
+### `LedgerEntry.java`
+
+Fields: `id`, `transactionId` (`UUID`), `accountId` (`UUID`), `amount` (`Long`), `currency`
+(`String` with `@JdbcTypeCode(SqlTypes.CHAR)`), `createdAt` (`Instant`, `insertable = false`).
+
+**`transactionId` and `accountId` are plain `UUID` fields, NOT `@ManyToOne` relationships.** This is a
+deliberate design decision and good interview material: object graphs bring lazy loading, N+1 queries
+and accidental cascades, none of which belong on a money path where you need to know exactly what SQL
+runs. Being able to explain *that* choice is worth more than knowing the annotation.
+
+**No setters** — an entry in an append-only journal is never modified after it is written.
+
+#### Six bugs, and why only one of them was a compiler error
+
+**Compiler error:**
+
+1. `@Column(name = "transaction_id", @ManyToOne = false)` — `@ManyToOne` is an *annotation*, not an
+   attribute that can be set. `LedgerEntry.java:[16,47] ')' expected`. "Not `@ManyToOne`" means simply
+   don't use it; a plain `UUID` field needs nothing special.
+
+**Compiled cleanly, would have broken on the first save:**
+
+2. **`this.id = id;` was missing.** The constructor accepted `id` and never assigned it, so every
+   `LedgerEntry` had a null primary key. Java never warns about this — an unassigned field is legal,
+   it's just `null`.
+3. **`createdAt` lacked `insertable = false`.** Hibernate would have included the column in the
+   `INSERT` with a null value, violating `NOT NULL`, while a perfectly good `DEFAULT now()` sat unused.
+4. **`public long getamount()` returning a primitive from a `Long` field.** Java auto-unboxes, and
+   **unboxing `null` throws NullPointerException** — from a plain getter, which is a baffling stack
+   trace to debug.
+
+**Missing / convention:**
+
+5. No `getId()` and no `getCreatedAt()`.
+6. Unused `import java.util.Currency;` (IDE auto-import), and `getamount` → `getAmount`.
+
+**The pattern worth remembering: the compiler catching one thing does not mean the rest is fine.**
+Bugs 2, 3 and 4 all compile and all break the first time a row is actually saved. That is exactly why
+the next step is tests against a real Postgres via Testcontainers.
+
+### The `currency` type mismatch — `validate` earning its keep
+
+```
+wrong column type in column [currency] in table [accounts];
+found [bpchar (Types#CHAR)], but expecting [varchar(3) (Types#VARCHAR)]
+```
+
+The DB column is `CHAR(3)`, which Postgres calls `bpchar`; Hibernate maps `String` to `varchar` by
+default. Fixed on the **Java** side:
+
+```java
+import org.hibernate.annotations.JdbcTypeCode;
+import org.hibernate.type.SqlTypes;
+
+@JdbcTypeCode(SqlTypes.CHAR)
+@Column(nullable = false, length = 3)
+private String currency;
+```
+
+**Why fix the Java rather than the database.** The alternative was a V5 migration changing both
+columns to `varchar(3)`. Rejected: the schema is written, applied and constraint-tested, and it is the
+source of truth. Rewriting a proven schema so an ORM's default mapping is satisfied is the tail
+wagging the dog — **the entity's job is to describe the database accurately.** (A V5 would also be
+defensible, since it removes `CHAR`'s blank-padding quirk, but it means dropping the composite FK and
+the unique constraint, altering both columns, then rebuilding them — more risk for a cosmetic gain.)
+
+### Verified
+
+`Started LedgerApplication in 2.944 seconds` and `{"status":"UP"}` — Hibernate compared all three
+entities against the tables Flyway built, every column name and type, and found no drift.
+Committed as `ed9a8d9`.
+
+---
+
+### Learning notes from Day 3
+
+**Why Maven has no "start script".** Maven is not a script runner. In npm, `package.json` maps a name
+to a shell command *you* write. Maven has only two invocable things:
+
+1. **Lifecycle phases** — a fixed sequence built into Maven: `validate → compile → test → package →
+   verify → install → deploy`. Running a phase runs every phase before it. You cannot rename them.
+2. **`plugin:goal`** — `spring-boot:run` is `<prefix>:<goal>`: the prefix resolves to
+   `spring-boot-maven-plugin`, and `run` is one goal it provides.
+
+The four lines declaring `spring-boot-maven-plugin` in the pom **are** the "scripts" block — except
+instead of authoring a command, a plugin was adopted and brought eleven goals with it
+(`run`, `build-image`, `repackage`, `start`, `stop`, `test-run`, …). Discover them with
+`./mvnw spring-boot:help`. Note `spring-boot:build-image` for later: it builds a production container
+image from the jar with **no Dockerfile at all**.
+
+| JavaScript | Java / Maven |
+|---|---|
+| `package.json` | `pom.xml` |
+| `node_modules/` (per project) | `~/.m2/repository` — **global, shared by every project** |
+| `npm start` (a script you wrote) | `./mvnw spring-boot:run` (a plugin goal) |
+| `npm run build` | `./mvnw package` |
+| `node dist/index.js` | `java -jar target/ledger-0.0.1-SNAPSHOT.jar` |
+
+The `node_modules` row is the one to internalise: Maven has no per-project dependency folder, which is
+why the first build downloaded 108MB and every build since has been fast, and why there is nothing in
+the project directory to delete when dependencies misbehave (clear `~/.m2` instead).
+
+---
+
+### Next: Day 4
+
+**1. Tidy the packages** (2 minutes, IDE *Refactor → Move* rewrites the `package` line and imports):
+
+```
+com.ledger
+├── LedgerApplication.java     (stays — @ComponentScan starts here)
+├── account/       Account, AccountRepository
+├── transaction/   LedgerTransaction, LedgerTransactionRepository
+├── entry/         LedgerEntry, LedgerEntryRepository
+└── transfer/      TransferService
+```
+
+Grouping by feature rather than by layer (no `entities/`, `repositories/` folders) is what most
+modern Spring codebases do.
+
+**2. The three repositories.** The surprising part: **you write an interface and never implement it.**
+At startup Spring Data scans for interfaces extending `JpaRepository`, generates an implementation at
+runtime, and registers it as a bean. `JpaRepository<T, ID>` gives `save`, `findById`, `findAll`,
+`delete`, `count` for free. **No `@Repository` annotation needed** — extending the interface is the
+signal.
+
+- `AccountRepository extends JpaRepository<Account, UUID>` with `List<Account> findByOwnerId(UUID)`.
+  A **derived** query: Spring builds the SQL from the method *name*, and `OwnerId` must match the
+  entity *field* name exactly. Misspell it and the app fails at **startup**, not at call time.
+- `LedgerTransactionRepository` with
+  `Optional<LedgerTransaction> findByIdempotencyKey(String idempotencyKey)`.
+  `Optional` rather than the bare type because "no such key" is a normal expected outcome, not an
+  error — it forces the caller to handle absence instead of tripping over `null`. This is how the
+  transfer service will recognise a retry.
+- `LedgerEntryRepository` with a balance query, which can't be derived because it's an aggregate:
+
+```java
+@Query("select coalesce(sum(e.amount), 0) from LedgerEntry e where e.accountId = :accountId")
+long balanceOf(@Param("accountId") UUID accountId);
+```
+
+Two things in that query matter. **It's JPQL, not SQL** — `LedgerEntry` is the *entity class* and
+`e.amount` / `e.accountId` are *Java field names*, not `ledger_entries` / `account_id`. Hibernate
+translates to SQL, and it's checked against the entity model at startup, so a typo fails the boot
+rather than a query in production. And **`coalesce(sum(...), 0)` is load-bearing**: SQL `SUM` over
+*zero* rows returns `NULL`, not `0`, so a brand-new account's balance would be null and unboxing it
+into a `long` return type would throw NPE — the same trap as bug 4 above, in a different place.
+
+Also add `List<LedgerEntry> findByTransactionId(UUID transactionId)`.
+
+**3. Then the transfer service** — a `@Transactional` method that writes a transaction plus its
+balanced entries, enforces the zero-sum invariant in Java, and handles a duplicate idempotency key by
+recognising the retry. First *behaviour* in the project rather than structure, and the code an
+interviewer will actually read.
+
+**4. Then the hard part:** concurrency. Two simultaneous withdrawals can both read a sufficient
+balance and both proceed, overdrawing the account. That's row locking (`SELECT … FOR UPDATE`) and
+isolation levels — the most interesting problem in the project, and the strongest interview material
+in it.

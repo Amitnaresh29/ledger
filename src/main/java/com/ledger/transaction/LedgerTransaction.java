@@ -1,4 +1,4 @@
-  package com.ledger;
+  package com.ledger.transaction;
   import jakarta.persistence.*;   // note: jakarta, not javax (Boot 3 moved namespaces)
   import java.time.Instant;
   import java.util.UUID;

@@ -1,4 +1,4 @@
- package com.ledger;
+ package com.ledger.entry;
   import jakarta.persistence.*;   // note: jakarta, not javax (Boot 3 moved namespaces)
   import org.hibernate.annotations.JdbcTypeCode;
   import org.hibernate.type.SqlTypes;
