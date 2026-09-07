@@ -19,6 +19,7 @@ import java.util.UUID;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import static org.assertj.core.api.Assertions.from;
 
 @DataJpaTest
 @AutoConfigureTestDatabase(replace = AutoConfigureTestDatabase.Replace.NONE)
@@ -47,21 +48,30 @@ class TransferServiceTest {
         return accounts.saveAndFlush(
                 new Account(UUID.randomUUID(), "ASSET", UUID.randomUUID(), "USD"));
     }
+    private Account newEquityAccount() {
+        return accounts.saveAndFlush(
+                new Account(UUID.randomUUID(), "EQUITY", UUID.randomUUID(), "INR"));
+    }
+    private void fund(Account target, long amountMinor) {
+      Account equity = newEquityAccount();
+      transferService.transfer("fund-" + target.getId(), equity.getId(), target.getId(), amountMinor, "funding");
+    }
 
     @Test
     void a_transfer_moves_money_and_writes_two_balanced_entries() {
         // ---- ARRANGE: set up the world the test needs ----
         Account from = newInrAccount();
         Account to = newInrAccount();
+        fund(from, 100_000L);
 
         // ---- ACT: do the ONE thing under test ----
         LedgerTransaction tx = transferService.transfer(
                 "transfer-1", from.getId(), to.getId(), 50_000L, "A pays B Rs 500");
 
         // ---- ASSERT: check what should now be true ----
-        // 50_000L - the underscores are just readability, Java ignores them.
-        // The L makes it a long, matching the method's parameter type.
-        assertThat(entries.balanceOf(from.getId())).isEqualTo(-50_000L);
+        // funded 100_000, sent 50_000, so the sender is left holding +50_000.
+        // The underscores are just readability; the L makes it a long.
+        assertThat(entries.balanceOf(from.getId())).isEqualTo(50_000L);
         assertThat(entries.balanceOf(to.getId())).isEqualTo(50_000L);
 
         // Exactly two entries, not one and not three.
@@ -72,12 +82,16 @@ class TransferServiceTest {
     void  a_retry_with_the_same_key_does_not_post_twice(){
         Account account1 = newInrAccount();
         Account account2 = newInrAccount();
+        fund(account1, 100_000L);
+
 
         LedgerTransaction first = transferService.transfer("transfer-1", account1.getId(), account2.getId(), 50_000L, null);
         LedgerTransaction second = transferService.transfer("transfer-1", account1.getId(), account2.getId(), 50_000L, null);
 
         assertThat(second.getId()).isEqualTo(first.getId());
-        assertThat(entries.balanceOf(account1.getId())).isEqualTo(-50_000L);
+        // funded 100_000 and sent 50_000 ONCE, so 50_000 remains.
+        // If the retry had posted again this would be 0.
+        assertThat(entries.balanceOf(account1.getId())).isEqualTo(50_000L);
     }
 
     @Test 
@@ -90,9 +104,20 @@ class TransferServiceTest {
     }
 
     @Test 
-    void unknown_account(){
-        Account InrAmount= newInrAccount();
-        assertThatThrownBy(() -> transferService.transfer("transfer-1", UUID.randomUUID(), InrAmount.getId(), 50_000L, null))
+    void a_transfer_from_an_unknown_account_is_rejected(){
+        Account inrAccount = newInrAccount();
+        assertThatThrownBy(() -> transferService.transfer("transfer-1", UUID.randomUUID(), inrAccount.getId(), 50_000L, null))
                 .isInstanceOf(AccountNotFoundException.class);
+    }
+
+    @Test 
+    void a_transfer_larger_than_the_balance_is_rejected(){
+        Account from = newInrAccount();
+        Account to = newInrAccount();
+        fund(from, 10_000L);          // only Rs 100 available
+
+        assertThatThrownBy(() -> transferService.transfer(
+                "t-insufficient", from.getId(), to.getId(), 50_000L, null))   // asking for Rs 500
+                .isInstanceOf(TransferRejectedException.class);
     }
 }

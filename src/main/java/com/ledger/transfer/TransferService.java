@@ -89,7 +89,7 @@ public class TransferService {
         // findById returns Optional<Account>. orElseThrow takes a lambda that
         // builds the exception - it is only invoked if the Optional is empty,
         // so we do not pay for the string concatenation on the happy path.
-        Account from = accounts.findById(fromAccountId)
+        Account from = accounts.findByIdforUpdate(fromAccountId)
                 .orElseThrow(() -> new AccountNotFoundException(fromAccountId));
         Account to = accounts.findById(toAccountId)
                 .orElseThrow(() -> new AccountNotFoundException(toAccountId));
@@ -106,6 +106,11 @@ public class TransferService {
                     "Currency mismatch: " + from.getCurrency() + " to " + to.getCurrency());
         }
         String currency = from.getCurrency();
+        long balance = entries.balanceOf(fromAccountId);
+
+        if (from.getAccountType().equals("ASSET") && balance < amountMinor) {
+            throw new TransferRejectedException("Insufficient funds: balance " + balance + ", requested " + amountMinor);
+        }
 
         // ---- STEP 5: build the transaction and its two signed entries ----
         LedgerTransaction tx =
