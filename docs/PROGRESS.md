@@ -634,3 +634,433 @@ interviewer will actually read.
 balance and both proceed, overdrawing the account. That's row locking (`SELECT … FOR UPDATE`) and
 isolation levels — the most interesting problem in the project, and the strongest interview material
 in it.
+
+---
+
+## Day 4 — 2026-09-03
+
+### Status: repositories written, first real tests against a real Postgres
+
+Commits: `773598c` (packages + log), `872062e` (derived query), `bf4298b` (repository tests).
+
+---
+
+### Package restructure
+
+Entities were scattered — `Account` in `com.ledger.account`, the other two in the root package
+next to `LedgerApplication`. Reorganised **by feature, not by layer**:
+
+```
+com.ledger
+├── LedgerApplication.java     (stays - @ComponentScan starts here and scans downward)
+├── account/       Account, AccountRepository
+├── transaction/   LedgerTransaction, LedgerTransactionRepository
+├── entry/         LedgerEntry, LedgerEntryRepository
+└── transfer/      TransferService + its exceptions
+```
+
+No `entities/` or `repositories/` folders. Grouping by feature is what most modern Spring codebases
+do, and it means a repository sits in the same package as its entity — so no imports between them.
+
+Two things the move required:
+- **`git mv`, not `mv`.** Git recorded it as a rename (`R` in status, `{ => entry}/LedgerEntry.java`
+  with 0 insertions and 0 deletions), so `git log --follow` still finds each file's earlier history.
+- **The `package` declaration had to change in each moved file.** Java requires it to match the
+  folder path; moving a file without editing line 1 fails to compile. (Kiro's *Refactor → Move* does
+  both steps.)
+
+---
+
+### The three repositories
+
+The surprising part of Spring Data: **you write an interface and never implement it.** At startup
+Spring Data scans for interfaces extending `JpaRepository`, generates an implementation at runtime,
+and registers it as a bean. `JpaRepository<T, ID>` provides `save`, `findById`, `findAll`, `delete`,
+`count` for free. **No `@Repository` annotation needed** — extending the interface is the signal.
+
+| repository | method | kind |
+|---|---|---|
+| `AccountRepository` | `List<Account> findByOwnerId(UUID)` | **derived** — Spring builds the SQL from the method *name*; `OwnerId` must match the entity *field* name exactly, and a misspelling fails at **startup**, not at call time |
+| `LedgerTransactionRepository` | `Optional<LedgerTransaction> findByIdempotencyKey(String)` | derived. `Optional` because "no such key" is a normal expected outcome, not an error — it forces the caller to handle absence instead of tripping over `null`. This is how the transfer service recognises a retry. |
+| `LedgerEntryRepository` | `long balanceOf(UUID)` | `@Query` JPQL — can't be derived because it's an aggregate |
+| | `List<LedgerEntry> findByTransactionId(UUID)` | derived |
+
+```java
+@Query("select coalesce(sum(e.amount), 0) from LedgerEntry e where e.accountId = :accountId")
+long balanceOf(@Param("accountId") UUID accountId);
+```
+
+**It's JPQL, not SQL.** `LedgerEntry` is the *entity class* and `e.amount` / `e.accountId` are *Java
+field names* — not `ledger_entries` / `account_id`. Hibernate translates to SQL, and the query is
+checked against the entity model at startup, so a typo fails the boot rather than a query in
+production.
+
+**`coalesce(sum(...), 0)` is load-bearing.** SQL `SUM` over *zero* rows returns `NULL`, not `0`. A
+brand-new account's balance would be null, and unboxing null into a `long` return type throws
+NullPointerException.
+
+**`@Param("accountId")`** binds the argument to the `:accountId` placeholder by name. Without it,
+Spring Data falls back to positional binding, which works with one parameter and silently breaks
+when a second is added.
+
+---
+
+### The balance query took three attempts, and that is the lesson
+
+**Attempt 1** mixed two things into one method:
+
+```java
+@Query("SELECT COALESCE(e.amount,0) FROM LedgerEntry e WHERE e.amount=:amount")
+Optional<LedgerEntry> findByIdempotencyKey(String idempotencyKey);
+```
+
+Five defects: `findByIdempotencyKey` belongs on the *transaction* repository (`LedgerEntry` has no
+such field); no `SUM`, so no aggregation; `COALESCE` on a `NOT NULL` column is a no-op protecting
+nothing; the filter was on `e.amount` instead of `e.accountId`; and the return type promised an
+entity for a query that selects a number.
+
+**The app started cleanly anyway.** Spring Data verified the JPQL *parses* — and it does. It cannot
+know you meant something else.
+
+**Attempt 2** fixed everything except the query string, leaving `:amount` in the JPQL while the
+method parameter was `@Param("accountId")`. **That started cleanly too** — Spring Data does not check
+at bootstrap that every named parameter has a matching argument.
+
+Proved the defect empirically by running the SQL equivalent against real data. Account A truly held
+`-50000 + 20000 = -30000`:
+
+| query | returned |
+|---|---|
+| the broken one | **-50000** — one row's amount, matched by amount value |
+| the correct one | **-30000** |
+
+Also unstable rather than merely wrong: `WHERE e.amount = ?` matches however many entries share that
+amount, so the method starts *throwing* instead of returning a wrong number as soon as two entries
+match. **Aggregate queries always return exactly one row; row-matching queries don't.**
+
+> **Three levels of the same lesson in two days:** `compile` passed on an empty class; startup passed
+> on an entity with a null-assigning constructor; startup passed on a balance query returning the
+> wrong number. **Nothing runnable so far actually checked that the code computes the right answer.**
+
+---
+
+### The first Testcontainers test
+
+`src/test/java/com/ledger/entry/LedgerEntryRepositoryTest.java`
+
+| element | what it does |
+|---|---|
+| `@DataJpaTest` | Loads **only** the JPA slice — entities, repositories, DataSource, Flyway. No Tomcat, no controllers. Also runs each test in a transaction that is **rolled back** afterwards, which is why there is no cleanup code. |
+| `@AutoConfigureTestDatabase(replace = NONE)` | `@DataJpaTest` normally swaps the database for an in-memory one. **That would defeat the whole exercise** — H2 has none of our `CHECK` constraints, no composite FK, no `bpchar`. `NONE` keeps the real DataSource. |
+| `@Testcontainers` | Activates the JUnit 5 extension managing container lifecycle. |
+| `static PostgreSQLContainer<?>` | **`static` matters** — one container per class, not per test method. |
+| `new PostgreSQLContainer<>("postgres:17")` | **Same image as production.** |
+| `@ServiceConnection` | Reads the container's randomly-assigned JDBC url, username and password and hands them to Spring. **No properties, no hardcoded ports** — the random port never collides with the 5433 dev container. |
+
+Each run: Testcontainers starts a throwaway Postgres → Flyway applies V1–V4 → entities validate →
+tests run → container destroyed. ~18 seconds, and worth every second: an H2 test would have passed
+against all three broken versions of `balanceOf`.
+
+**Then proved the test could fail.** Temporarily restored the broken query and it errored instantly:
+`org.hibernate.QueryParameterException: No argument for named parameter ':amount'` — which is also
+where the parameter mismatch surfaces: at *call* time, not startup. **A passing test proves nothing
+until you have seen it fail.**
+
+---
+
+### Four constraint tests, and three ideas in them
+
+| test | result |
+|---|---|
+| `amount = 0` | rejected — `ledger_entries_amount_check` |
+| `currency = NULL` | rejected — not-null constraint |
+| entry on a nonexistent transaction | rejected — foreign key |
+| reused `idempotency_key` | rejected — **retry safety, enforced by the database** |
+
+**1. `saveAndFlush`, not `save`.** `save()` doesn't send SQL — Hibernate keeps changes in memory and
+writes at flush, normally at commit. But `@DataJpaTest` rolls back instead of committing, so with
+plain `save()` the INSERT may never reach Postgres, no constraint fires, and the test fails with
+"expected an exception but nothing was thrown". **A constraint test has to make the database actually
+see the row.**
+
+**2. `DataIntegrityViolationException`, not `SQLException`.** Postgres raises a `SQLException`; Spring
+catches it and rethrows its own. That translation is what Spring Data buys you — the service layer
+never knows it is talking to Postgres. It also determines what the transfer service catches.
+
+**3. `assertThatThrownBy(() -> ...)`** — the lambda defers the call so AssertJ can invoke it and
+inspect what was thrown.
+
+**Guard against vacuous passes:** the first test in the same class saves four *valid* entries
+successfully, which proves `saveAndFlush` works for good data — so the failures in the later tests
+must be caused by exactly what differs. The `"USD"` test is a good example: `USD` satisfies the
+currency regex `CHECK`, so only V4's composite FK can be rejecting it.
+
+---
+
+### Lesson: Maven's incremental compilation can lie
+
+`./mvnw test-compile` reported **BUILD SUCCESS** on a file containing a genuine compile error;
+`./mvnw clean test-compile` reported **BUILD FAILURE**. Maven decided the file didn't need
+recompiling and reused a stale class file. **When Maven's answer doesn't match reality, add `clean`.**
+
+---
+
+## Days 5–7 — 2026-09-04 → 2026-09-07
+
+### Status: Milestone A's hardest piece done — a service that cannot double-post and cannot be overdrawn
+
+Commits: `4140139` (TransferService + tests), `5c51e38` (pessimistic lock).
+**12 tests green**, including a real concurrency test.
+
+---
+
+### `TransferService` — the centrepiece
+
+`transfer(idempotencyKey, fromAccountId, toAccountId, amountMinor, description)` returning the
+`LedgerTransaction`. `amountMinor` is **positive**; direction comes from `from`/`to`, and the service
+derives the two signed entries itself. Deliberate: the zero-sum invariant is what this class exists
+to protect, and it can only protect it if entry construction happens in exactly one place.
+
+| step | what and why |
+|---|---|
+| 1 | **Idempotency check first.** `findByIdempotencyKey` — if present, return it and post nothing. A retry becomes a no-op returning the original result. |
+| 2 | Reject same-account transfers (two entries on one account sum to zero — balanced but meaningless) and non-positive amounts. |
+| 3 | Load both accounts, `orElseThrow(AccountNotFoundException)`. |
+| 4 | **Currencies must match.** The database *cannot* check this: an INR→USD transfer writes a legal INR entry on the INR account and a legal USD entry on the USD account, both satisfying V4's composite FK, summing to zero numerically, and complete nonsense. Real cross-currency movement needs an FX rate and a third account. **So this invariant has to live in Java.** |
+| 4b | **Balance check** (added later) — see the funding section below. |
+| 5 | Build the transaction and two entries: `-amount` on `from`, `+amount` on `to`. `List.of(...)` is immutable so nobody can add a third entry later. |
+| 6 | **Assert zero-sum before writing**, via `lines.stream().mapToLong(LedgerEntry::getAmount).sum()`. It "cannot" fail since we just built them — which is exactly why it belongs there: it states the invariant executably and catches the future edit that breaks it. `IllegalStateException`, not `TransferRejectedException`. |
+| 7 | Save transaction **first** (the entries' FK points at it), with `saveAndFlush` so a duplicate key fails inside the method rather than at commit time outside it. |
+
+### `@Transactional` — the two interview traps
+
+One database transaction wraps the method: either the transaction row **and** both entries commit, or
+none do. A half-written transfer is impossible.
+
+**Trap 1 — no rollback on checked exceptions.** Spring rolls back on `RuntimeException` and `Error`
+only. A checked exception leaves partial writes **committed**. That is why both domain exceptions
+extend `RuntimeException`.
+
+**Trap 2 — it is proxy-based AOP.** Spring wraps the bean in a proxy that opens the transaction. So a
+`@Transactional` method called from another method **on `this`** bypasses the proxy and runs with
+**no transaction at all**, silently. The method must also be `public` to be intercepted.
+
+### Constructor injection over `@Autowired` fields
+
+Fields can be `final` (immutable, safe to share across request threads); dependencies are explicit
+rather than hidden in annotations; the class can be built in a unit test with plain `new`; and a
+missing dependency fails at **startup** instead of first call. No `@Autowired` needed with a single
+constructor.
+
+---
+
+### Two corrections to the original design
+
+**1. The "catch `DataIntegrityViolationException` and re-read" idea does not work.** It was the
+obvious way to make a lost idempotency race graceful, and it is wrong twice over:
+- In Postgres a constraint violation **aborts the whole transaction**; every subsequent statement
+  fails with "current transaction is aborted", so the re-read inside the `catch` throws too.
+- With plain `save()` the INSERT flushes at *commit*, after the `try` block has exited, so the catch
+  never fires at all.
+
+The honest design: `saveAndFlush` makes the duplicate fail inside the method, the whole method rolls
+back, and nothing is posted. **The guarantee is intact** — no double-post. Turning it into a graceful
+"return the existing transaction" needs a *separate* transaction, which belongs at the REST layer.
+
+**2. Returning `boolean` instead of the transaction** loses the id the API response needs, and
+`false` on a retry is wrong semantically: a retry is a success that already happened, not a failure.
+
+---
+
+### Code-review findings on the first attempt
+
+- **`import jakarta.transaction.Transactional`** instead of
+  `org.springframework.transaction.annotation.Transactional`. Two annotations share the name; the
+  IDE auto-imported the wrong one. Jakarta's is a subset — Spring's supports `propagation`,
+  `isolation`, `readOnly`, `rollbackFor`.
+- **`if (transaction)` on an `Optional`** — a **JavaScript reflex**, not a syntax gap. Java has no
+  truthiness: `if` accepts a `boolean` and nothing else. You ask an Optional a question:
+  `.isPresent()` / `.isEmpty()`.
+- `.equals()` vs `==`: `==` compares references, `.equals()` compares values. Two `UUID` objects can
+  hold the identical 128-bit value and still not be `==`, which is why `==` bugs pass in testing and
+  fail in production.
+
+### Learning-mode change
+
+Writing a service from a prose spec was too big a jump — it asked for control flow, exception
+handling, collections and streams at once, in a language whose instincts weren't there yet. Switched
+to a four-step scaffold: **I write it annotated → questions and explain-back → he modifies it → he
+writes the next similar thing.** Entities and migrations were simple enough shapes to skip the first
+three steps; services and tests are not.
+
+**Also: do the DSA practice in Java**, so syntax fluency and the DSA workstream collapse into one.
+Small Java programs using loops, arrays, `ArrayList`, `HashMap` and `String` are exactly the missing
+fundamentals — and much better practice than reading a syntax reference.
+
+---
+
+### Test-writing lessons
+
+- **Test methods return `void`.** JUnit refuses to run a `@Test` that returns a value.
+- **A test never uses `if` to check something.** With `if`, a false condition simply skips the block
+  and the test **passes**. An assertion is the opposite: it aborts the test when false. *Every test
+  body is arrange, act, then `assertThat(...)` lines — no `if`, no loops, no returns.*
+- **`isEqualTo` lives on what `assertThat(...)` returns**, not on `UUID`. The pattern is always
+  `assertThat(actual).isEqualTo(expected)`.
+- **A test must never contain a copy of the logic it tests.** One attempt at the insufficient-funds
+  test re-implemented the service's balance check inside the test body, never called
+  `transferService.transfer(...)`, and had no assertion — so it passed while verifying nothing.
+  Fatal property: **delete the balance check from the service and that test still passes.**
+- **Assert on the right layer.** A currency mismatch produced `TransferRejectedException` (Java step
+  4), not `DataIntegrityViolationException` — the same-sounding scenario tested two days earlier at
+  the *entry* level was caught by Postgres. Same words, different mechanism, because the database is
+  structurally incapable of catching the account-to-account case.
+- **Ask whether a failure is for the reason you're testing.** An early version passed `0` as the
+  amount, so the service rejected it for being non-positive and the test died before reaching
+  idempotency at all.
+
+### The idempotency test, and proof it has teeth
+
+Two calls with the same key must return the same transaction id **and** leave the balance moved only
+once. Disabling the Java check made it fail immediately:
+
+```
+duplicate key value violates unique constraint "transactions_idempotency_key_key"
+```
+
+Which reveals the two-layer design:
+
+| layer | job | without it |
+|---|---|---|
+| step 1 in Java | return the original transaction, no error | an ugly 500 instead of a clean replay |
+| `UNIQUE` in the DB | makes double-posting **impossible** | the customer is charged twice |
+
+**The money still did not move twice with the Java check removed.** So: *"idempotency is enforced by a
+unique constraint in the database; the application-level check is an optimisation, not the
+guarantee."* Most candidates describe a check-then-insert in code — which races.
+
+---
+
+### The balance check exposed a modelling gap
+
+The check itself is four lines. But existing accounts start at **zero** and money had never entered
+the system, so every test broke — the sender had nothing to send. That is not a test problem; it is
+the check revealing that the ledger had **no answer for where money comes from.**
+
+The accounting answer is what `account_type` was for all along. Money enters from an **EQUITY**
+account, which legitimately holds a negative balance — it represents value issued into the ledger. A
+customer's **ASSET** account must never go negative. So the rule is not "no account goes negative":
+
+```java
+if (from.getAccountType().equals("ASSET") && balance < amountMinor) {
+    throw new TransferRejectedException("Insufficient funds: balance " + balance + ", requested " + amountMinor);
+}
+```
+
+The five account types written into V1 on day one, dormant ever since, turned out to carry real
+meaning. Tests now fund an ASSET account from an EQUITY account before transferring.
+
+---
+
+### The concurrency race — the highlight
+
+`TransferConcurrencyTest` funds an account with exactly ₹500, then fires **five** simultaneous
+transfers of ₹500 through an `ExecutorService`, released together by a `CountDownLatch` so they hit
+the service at the same instant rather than trickling in.
+
+**`@SpringBootTest`, not `@DataJpaTest`** — and that distinction is essential. `@DataJpaTest` wraps
+each test in a transaction and rolls it back, so separate threads could never see each other's
+committed data. Concurrency can only be tested with **real commits**, which means no test-managed
+transaction. `WebEnvironment.NONE` skips Tomcat.
+
+Result with the balance check in place and looking perfectly correct:
+
+```
+>>> succeeded=5   final balance=-200000
+expected: 1 but was: 5
+```
+
+An account holding ₹500 sent ₹2,500 and ended at **−₹2,000**.
+
+**Why.** The check is a **read, then write**, with a gap:
+
+| time | thread 1 | threads 2–5 |
+|---|---|---|
+| t1 | `balanceOf` → 50,000 | `balanceOf` → 50,000 |
+| t2 | `50_000 < 50_000`? no → proceed | same → proceed |
+| t3 | insert, commit | insert, commit |
+
+Postgres runs at `READ COMMITTED`, so each transaction sees only data committed when its statement
+ran — and nothing was committed yet. **The check is not wrong; it is correct for one thread at a
+time. It just is not atomic.** Reading a balance to decide whether to permit a debit is the textbook
+form of the most common class of bug in financial software.
+
+Note also that **nothing in the schema helped.** Every `CHECK`, the composite FK, the `UNIQUE` key —
+all satisfied. Every individual row was legal. The invariant that broke spans rows, and no per-row
+constraint can see it.
+
+### The fix: a pessimistic row lock on the sender
+
+```java
+@Lock(LockModeType.PESSIMISTIC_WRITE)
+@Query("select a from Account a where a.id = :id")
+Optional<Account> findByIdForUpdate(@Param("id") UUID id);
+```
+
+…then load `from` with it instead of `findById`. `to` stays unlocked — no decision depends on the
+receiver's balance, so locking it would add contention for nothing.
+
+Result: `>>> succeeded=1  final balance=0`.
+
+**The key insight: the lock is taken on the `accounts` row even though the balance lives in
+`ledger_entries`.** The account row holds none of the protected data — it acts as a **mutex** for that
+account. It works only because every writer agrees to grab the same row first. That convention *is*
+the mechanism.
+
+### What Hibernate actually emitted, and why it matters
+
+```sql
+select ... from accounts a1_0 where a1_0.id=? for no key update
+```
+
+**`FOR NO KEY UPDATE`, not `FOR UPDATE`** — one notch weaker. Postgres row-lock conflicts:
+
+| mode | conflicts with |
+|---|---|
+| `FOR KEY SHARE` | `FOR UPDATE` only — this is what **foreign-key checks** take |
+| `FOR NO KEY UPDATE` | `FOR SHARE`, `FOR NO KEY UPDATE`, `FOR UPDATE` |
+| `FOR UPDATE` | everything |
+
+It **conflicts with itself**, so two transfers on the same sender still serialise — which is what
+made `succeeded=1`. What it does *not* block is `FOR KEY SHARE`, and that turns out to matter:
+
+**Correction to an earlier claim:** two simultaneous transfers A→B and B→A **cannot** deadlock here.
+Every `INSERT` into `ledger_entries` takes `FOR KEY SHARE` on both referenced account rows for the FK
+check. Transfer 1 holds `FOR NO KEY UPDATE` on A and needs `FOR KEY SHARE` on A and B; transfer 2
+holds it on B and needs the same. Since `FOR KEY SHARE` does not conflict with `FOR NO KEY UPDATE`,
+neither waits on the other — **no cycle**. Had Hibernate used the stronger `FOR UPDATE`, that would
+be a genuine deadlock. The weaker lock is a feature.
+
+Lock ordering (sort the ids, lock the lower first) only becomes necessary if **both** accounts are
+locked. Locking only the sender — the minimum the decision requires — avoids the problem entirely,
+which is a better answer than "I sort the ids".
+
+---
+
+### Next: Day 8
+
+**Milestone A has one piece left: the REST API.**
+
+1. `POST /transfers` and `GET /accounts/{id}/balance` in a `@RestController`.
+2. Request/response DTOs as Java **records** (also closes the records gap).
+3. `@Valid` on the request body for input validation.
+4. A `@ControllerAdvice` mapping exceptions to status codes: `TransferRejectedException` → **400**,
+   `AccountNotFoundException` → **404**, `DataIntegrityViolationException` → **409 Conflict** (the
+   lost idempotency race, handled gracefully at the layer where a second transaction is natural).
+5. MockMvc tests.
+6. **The README** — the file an interviewer reads first. Explain the double-entry model, why there is
+   no balance column, and how to run it.
+
+Then Milestone B: a container image via `spring-boot:build-image` (no Dockerfile needed), GitHub
+Actions running the Testcontainers suite, and a deploy. Estimated **~5 sessions to interview-ready,
+~9 to fully finished** — roughly two to three weeks at the current pace.
