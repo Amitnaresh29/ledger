@@ -141,9 +141,15 @@ public class TransferService {
         // Flushing now means a duplicate idempotency_key - a concurrent request
         // that slipped past step 1 - blows up HERE, inside the method, instead of
         // at commit time outside it.
-        transactions.saveAndFlush(tx);
+        // Use what save() RETURNS, not what you passed in. Because the id is
+        // assigned (not @GeneratedValue), Spring Data sees a non-null id, treats
+        // the entity as detached and calls merge() - which copies state onto a
+        // DIFFERENT managed instance and returns that. Hibernate's @Generated
+        // read-back populates created_at on the managed copy, so returning the
+        // original `tx` would hand the caller a null createdAt.
+        LedgerTransaction saved = transactions.saveAndFlush(tx);
         entries.saveAll(lines);
 
-        return tx;
+        return saved;
     }
 }

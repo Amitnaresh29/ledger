@@ -4,6 +4,8 @@
   import org.hibernate.type.SqlTypes;
   import java.time.Instant;
   import java.util.UUID;
+  import org.hibernate.annotations.Generated;
+  import org.hibernate.generator.EventType;
 
   @Entity                          // "this class maps to a table"
   @Table(name = "accounts")        // the table name. Without this, Hibernate guesses "account"
@@ -26,6 +28,7 @@
 
       // The DB sets this via DEFAULT now(). insertable=false tells Hibernate to leave it
       // out of the INSERT so the default applies; updatable=false because it never changes.
+      @Generated(event = EventType.INSERT)
       @Column(name = "created_at", nullable = false, insertable = false, updatable = false)
       private Instant createdAt;
 

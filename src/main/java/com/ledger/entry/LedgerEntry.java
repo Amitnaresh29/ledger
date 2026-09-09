@@ -4,6 +4,8 @@
   import org.hibernate.type.SqlTypes;
   import java.time.Instant;
 import java.util.UUID;
+import org.hibernate.annotations.Generated;
+  import org.hibernate.generator.EventType;
 
 
 @Entity()
@@ -24,6 +26,7 @@ public class LedgerEntry {
     @Column(nullable = false, length = 3)
     private String currency;
 
+    @Generated(event = EventType.INSERT)
     @Column(name = "created_at",nullable = false , insertable = false,updatable = false)
     private Instant createdAt;
 

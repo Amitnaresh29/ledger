@@ -2,6 +2,8 @@
   import jakarta.persistence.*;   // note: jakarta, not javax (Boot 3 moved namespaces)
   import java.time.Instant;
   import java.util.UUID;
+  import org.hibernate.annotations.Generated;
+  import org.hibernate.generator.EventType;
 
 @Entity
 @Table(name = "transactions")
@@ -14,6 +16,7 @@ public class LedgerTransaction {
 
     private String description;
 
+    @Generated(event = EventType.INSERT)
     @Column( name = "created_at",nullable = false , insertable = false,updatable = false)
     private Instant createdAt;
 
