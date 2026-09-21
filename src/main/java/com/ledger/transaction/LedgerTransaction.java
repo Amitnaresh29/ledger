@@ -30,8 +30,8 @@ public class LedgerTransaction {
     }
 
     public UUID getId() { return id; }
-      public String getIdempotencyKey() { return idempotencyKey; }
-      public String getDescription() { return description; }
-      public Instant getCreatedAt() { return createdAt; }
+    public String getIdempotencyKey() { return idempotencyKey; }
+    public String getDescription() { return description; }
+    public Instant getCreatedAt() { return createdAt; }
 
 }
