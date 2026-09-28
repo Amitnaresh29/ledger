@@ -1,0 +1,84 @@
+### Ledger API — live request collection
+#
+# Open this file in Kiro/VS Code (install the "REST Client" extension) or IntelliJ,
+# and a "Send Request" link appears above each ### block. Click it and the response
+# opens in a side panel.
+#
+# Why this file is in the repo: it is version-controlled documentation that actually
+# runs. A new developer clones, starts the app, and clicks through the whole API
+# without installing Postman or writing a single curl command.
+#
+# Before running: docker compose up -d --wait  &&  ./mvnw spring-boot:run
+
+@host = http://localhost:8080
+
+### Health check
+GET {{host}}/actuator/health
+
+### Balance of an account
+# Replace the UUID with a real one from your database:
+#   docker exec ledger-postgres psql -U ledger -d ledger -c "select id, account_type from accounts;"
+GET {{host}}/accounts/aaaaaaaa-0000-0000-0000-000000000001/balance
+
+### Transfer money  (expect 201)
+POST {{host}}/transfers
+Content-Type: application/json
+Idempotency-Key: demo-001
+
+{
+  "fromAccountId": "aaaaaaaa-0000-0000-0000-000000000001",
+  "toAccountId": "bbbbbbbb-0000-0000-0000-000000000002",
+  "amountMinor": 50000,
+  "description": "A pays B Rs 500"
+}
+
+### Same request again — idempotent replay (expect the SAME transactionId, no second debit)
+POST {{host}}/transfers
+Content-Type: application/json
+Idempotency-Key: demo-001
+
+{
+  "fromAccountId": "aaaaaaaa-0000-0000-0000-000000000001",
+  "toAccountId": "bbbbbbbb-0000-0000-0000-000000000002",
+  "amountMinor": 50000,
+  "description": "A pays B Rs 500"
+}
+
+### Unknown account  (expect 404, error = account_not_found)
+GET {{host}}/accounts/99999999-9999-9999-9999-999999999999/balance
+
+### Insufficient funds  (expect 400, error = transfer_rejected)
+POST {{host}}/transfers
+Content-Type: application/json
+Idempotency-Key: demo-too-big
+
+{
+  "fromAccountId": "aaaaaaaa-0000-0000-0000-000000000001",
+  "toAccountId": "bbbbbbbb-0000-0000-0000-000000000002",
+  "amountMinor": 99999900,
+  "description": "more than the balance"
+}
+
+### Validation failure  (expect 400 with fields.amountMinor)
+POST {{host}}/transfers
+Content-Type: application/json
+Idempotency-Key: demo-negative
+
+{
+  "fromAccountId": "aaaaaaaa-0000-0000-0000-000000000001",
+  "toAccountId": "bbbbbbbb-0000-0000-0000-000000000002",
+  "amountMinor": -500,
+  "description": "negative"
+}
+
+### Transfer to the same account  (expect 400)
+POST {{host}}/transfers
+Content-Type: application/json
+Idempotency-Key: demo-self
+
+{
+  "fromAccountId": "aaaaaaaa-0000-0000-0000-000000000001",
+  "toAccountId": "aaaaaaaa-0000-0000-0000-000000000001",
+  "amountMinor": 100,
+  "description": "self transfer"
+}
