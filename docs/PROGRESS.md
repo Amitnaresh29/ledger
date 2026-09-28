@@ -1064,3 +1064,358 @@ which is a better answer than "I sort the ids".
 Then Milestone B: a container image via `spring-boot:build-image` (no Dockerfile needed), GitHub
 Actions running the Testcontainers suite, and a deploy. Estimated **~5 sessions to interview-ready,
 ~9 to fully finished** — roughly two to three weeks at the current pace.
+
+---
+
+## Day 8 — 2026-09-08
+
+### Status: the first HTTP endpoint
+
+Commit `277ed72`. `POST /transfers` works end to end over real HTTP. Milestone A's last piece —
+the REST layer — begins.
+
+---
+
+### `TransferRequest` — a record, and what that buys
+
+`src/main/java/com/ledger/transfer/TransferRequest.java`
+
+```java
+public record TransferRequest(
+        @NotNull(message = "fromAccountId is required")  UUID fromAccountId,
+        @NotNull(message = "toAccountId is required")    UUID toAccountId,
+        @Positive(message = "amountMinor must be positive") long amountMinor,
+        String description) {}
+```
+
+**`record`, not `class`.** One line generates private final fields, a constructor, accessors
+(`fromAccountId()`, **not** `getFromAccountId()`), plus `equals`, `hashCode` and `toString`.
+Immutable by design, which is exactly right for a request payload — and this is the reason Lombok was
+never needed. First real use of records in the project, closing one of the flagged Java gaps.
+
+**`idempotencyKey` is deliberately NOT in the body.** It travels as an HTTP header
+(`Idempotency-Key`), which is the industry convention — Stripe, Adyen and others all do this. It is
+metadata *about the request*, not part of the money movement being described.
+
+**Validation lives on the DTO** so bad input is rejected before it reaches the service. Note the
+overlap is intentional: `@Positive` here gives a clean 400 naming the field, while the service's own
+`amountMinor <= 0` check is the guarantee for any caller that is not the REST layer.
+
+---
+
+### `TransferResponse` — a separate record from the entity, on purpose
+
+**Never return JPA entities from a controller.** It couples the public API to the database schema, so
+a column rename silently becomes a breaking API change, and serialising a managed entity can trigger
+lazy loading during JSON writing.
+
+---
+
+### `TransferController`
+
+| element | what it does |
+|---|---|
+| `@RestController` | `@Controller` + `@ResponseBody`. The second half is what makes every return value serialised to JSON instead of being treated as the name of an HTML view. |
+| `@RequestMapping("/transfers")` | base path for every method in the class |
+| `@PostMapping` | maps `POST /transfers` |
+| `@ResponseStatus(HttpStatus.CREATED)` | 201 instead of the default 200 |
+| `@RequestHeader("Idempotency-Key")` | pulls the header. Required by default — a missing header is a 400 before the method body runs. |
+| `@Valid @RequestBody` | **`@Valid` is what actually RUNS the annotations on the record.** Without it they are inert decoration and invalid input sails straight through. |
+
+The controller's entire job is translating HTTP into a service call and back. No business logic —
+which is exactly why `TransferService` remains testable with no HTTP at all.
+
+---
+
+### First run over real HTTP
+
+```
+POST /transfers  (EQUITY -> ASSET, funding)   -> 201
+POST /transfers  (ASSET -> ASSET, Rs 500)     -> 201
+```
+
+Balances across all three accounts: `-100000`, `+50000`, `+50000` — **summing to zero.** The
+double-entry invariant held end to end, over HTTP, for the first time.
+
+But two problems showed up immediately.
+
+**1. `"createdAt": null` in every response** — chased on Day 9.
+
+**2. Error statuses were wrong:**
+
+| case | got | should be |
+|---|---|---|
+| negative amount | 400 ✓ | 400 — `@Valid` works |
+| missing `Idempotency-Key` | 400 ✓ | 400 |
+| insufficient funds | **500** ✗ | 400 |
+| unknown account | **500** ✗ | 404 |
+
+Every domain exception became a 500 — Spring's default for an unhandled `RuntimeException`. That is
+actively harmful: it tells the client "we are broken, do not retry" when the truth is "your request
+was invalid", and it would page an on-call engineer for a typo'd account id.
+
+---
+
+## Day 9 — 2026-09-09
+
+### Status: balance endpoint live, and a genuinely subtle JPA bug found
+
+Commit `1f52718`.
+
+---
+
+### The `created_at` hunt — two causes, and the second one was the interesting one
+
+**Cause 1: no read-back.** `@Column(insertable = false)` tells Hibernate to leave the column out of
+the `INSERT` so `DEFAULT now()` applies — and then Hibernate never `SELECT`s it back, so the
+in-memory object keeps its `null`. Fix: Hibernate's
+
+```java
+@Generated(event = EventType.INSERT)
+```
+
+on `createdAt` in all three entities, which makes Hibernate issue a `SELECT` after the `INSERT`.
+
+**It still came back null.** Verified with `javap` that the annotation really was in the compiled
+bytecode, which ruled out a stale build and forced a better explanation.
+
+**Cause 2, the real one — a bug in the service:**
+
+```java
+transactions.saveAndFlush(tx);
+return tx;            // the ORIGINAL object
+```
+
+Because `LedgerTransaction` has an **assigned** id rather than `@GeneratedValue`, Spring Data's
+`save()` sees a non-null id, concludes the entity is *detached*, and calls `EntityManager.merge()`.
+`merge` copies the state onto a **different, managed instance** and returns *that* one. Hibernate's
+read-back populated `createdAt` on the managed copy, while `tx` — the detached original being
+returned — was never touched.
+
+```java
+LedgerTransaction saved = transactions.saveAndFlush(tx);
+return saved;         // "createdAt":"2026-09-09T15:52:08.283549Z"
+```
+
+> **The rule: always use what `save()` returns, never the object you passed in.**
+
+**What pinned the diagnosis** was a contrast in the data. The *retry* path had been returning a
+populated `createdAt` all along — because it goes through `findByIdempotencyKey`, which **reads the
+row from the database**. Fresh insert: null. Read from DB: populated. Same field, same request shape,
+different code path.
+
+With generated ids this bug announces itself immediately (your id is null). With assigned ids the
+object *looks* fine, so it hides until some database-generated field comes back empty. It is really a
+question about `persist` vs `merge`, and good interview material.
+
+---
+
+### `AccountController` and `GET /accounts/{id}/balance`
+
+New shapes: `@GetMapping("/{id}/balance")` and `@PathVariable UUID id`, which binds the `{id}`
+segment of the URL to a method parameter.
+
+```json
+{"accountId":"aaaaaaaa-...","currency":"INR","balanceMinor":48000}
+```
+
+**Two judgement calls, both right:**
+
+**A `BalanceResponse` record rather than a bare `long`.** Returning `50000` tells the client nothing
+about units and cannot be extended later without breaking every consumer.
+
+**An existence check before the balance query.** Without `findById(...).orElseThrow(...)`,
+`GET /accounts/<random-uuid>/balance` would cheerfully answer `0`, because summing zero rows gives
+zero — and the caller could not distinguish "this account is empty" from "this account does not
+exist".
+
+**Review findings on the first attempt**, all on one line:
+- **Missing `new`.** `BalanceResponse(...)` is not a valid expression; Java reads it as a call to a
+  *method* of that name. There is no way to construct an object without `new`.
+- **`long balanceMinor` passed as an argument.** That is a *declaration*, but the variable was already
+  declared a line earlier. In an argument list you pass a value, so you name it. (This produced the
+  cryptic `'.class' expected`, because the only legal expression starting with `long` is `long.class`.)
+  **You declare a variable once, with its type; everywhere after, you refer to it by name only.**
+- **Return type was `String`** while a `BalanceResponse` was returned. This also matters for the API:
+  returning a record makes Spring serialise JSON; `String` would put the raw text in the body.
+- Unused import, and imports of classes *in the same package* — never needed.
+
+---
+
+### A nastier version of the Day 4 build lesson
+
+The app refused to start with:
+
+```
+cannot access LedgerTransaction
+incompatible types: LedgerTransaction cannot be converted to com.ledger.transaction.LedgerTransaction
+```
+
+which reads like two duplicate classes existing. There was only ever one. A `-q clean compile` had
+built *main* classes only, then `spring-boot:run` triggered test compilation against a half-populated
+`target/`, and javac reported nonsense instead of the real state. `./mvnw clean test-compile`
+succeeded immediately.
+
+> **When an error is impossible, suspect the build before the code.**
+
+---
+
+## Day 10 — 2026-09-21
+
+### Status: exception mapping done, first API test green. Milestone A is three small items away.
+
+Commit `5b7b16b`.
+
+---
+
+### `GlobalExceptionHandler` — where the exception types finally pay off
+
+New package `com.ledger.api`, because exception mapping is genuinely cross-cutting — it is not
+"about" accounts or transfers, so it belongs in neither.
+
+**`@RestControllerAdvice`** = `@ControllerAdvice` + `@ResponseBody`. Spring registers it globally: any
+exception escaping *any* controller is offered to its handlers, most specific match wins.
+
+| exception | status | verified body |
+|---|---|---|
+| `AccountNotFoundException` | **404** | `"error":"account_not_found"` |
+| `TransferRejectedException` | **400** | `"Insufficient funds: balance 48000, requested 99999900"` |
+| `DataIntegrityViolationException` | **409** | generic conflict message |
+| `MethodArgumentNotValidException` | **400** | `"fields":{"amountMinor":"amountMinor must be positive"}` |
+
+**This is the payoff for making `TransferRejectedException` and `AccountNotFoundException` separate
+classes** rather than one exception carrying a message. Distinct types are the *only* reason they can
+map to distinct HTTP meanings. One type, and the API could not tell "that account does not exist"
+from "your amount is invalid".
+
+The validation handler uses a **stream** — `getFieldErrors().stream().collect(toMap(...))` — closing
+another flagged Java gap. The third argument to `toMap` is a merge function, needed because one field
+can fail two annotations at once; without it a duplicate key throws `IllegalStateException`.
+
+### Three decisions inside it
+
+**1. `DataIntegrityViolationException` -> 409, and it had to live here.** This is the lost idempotency
+race: two identical requests, both past the service's step-1 check, and the `UNIQUE` constraint let
+one win. Handling it *inside* the service was attempted and abandoned on Day 5 — a Postgres
+constraint violation **aborts the whole transaction**, so the catch block could not re-read the
+winner's row. At the HTTP layer we are **outside** that transaction, which is exactly why this is its
+natural home. 409 tells the client: a concurrent request conflicted, the other succeeded, re-read
+rather than retrying blindly.
+
+**2. The conflict body never echoes the exception message.** `DataIntegrityViolationException`'s
+message contains table, column and constraint names — publishing it hands an attacker a free map of
+the schema. Logged server-side, replaced with a generic message in the response.
+
+**3. Deliberately NO `@ExceptionHandler(Exception.class)`** — and this was verified empirically:
+
+```
+missing Idempotency-Key header -> 400
+malformed JSON                 -> 400
+bad UUID in the path           -> 400
+```
+
+Spring already handles all three correctly. A blanket catch-all looks tidy and would have **silently
+turned them into 500s**, making the API worse while appearing more thorough. To add one safely the
+class must `extend ResponseEntityExceptionHandler`, which preserves Spring's own handling. Until
+then, unhandled exceptions fall through to Spring's default 500 — the right status for "our bug".
+
+> **A catch-all handler is a foot-gun: it also catches what the framework was handling better than you will.**
+
+### `ApiError`
+
+One consistent error shape for every failure, so a client can parse any error from this service with
+the same code. `error` is a stable machine-readable code that clients branch on; `message` is human
+text that can be reworded freely. `@JsonInclude(NON_NULL)` omits `fields` entirely rather than
+emitting `"fields": null` on every response. A second, shorter constructor delegates via `this(...)` —
+that is how a record adds convenience constructors.
+
+---
+
+### First MockMvc test
+
+`src/test/java/com/ledger/api/TransferApiTest.java` — **13 tests green.**
+
+`@SpringBootTest` + `@AutoConfigureMockMvc`. MockMvc drives the real Spring MVC machinery — routing,
+argument binding, `@Valid`, Jackson, the `@RestControllerAdvice` — **without opening a socket**.
+Everything a real request touches, none of the cost.
+
+Three things new in this file:
+- **Static imports** of `post(...)`, `status()`, `jsonPath(...)` from `MockMvcRequestBuilders` and
+  `MockMvcResultMatchers`. The usual first stumble, because the IDE offers several similar classes.
+- **Java text blocks** (`"""`) for the JSON body, with `.formatted(...)` filling `%s` placeholders —
+  another Java feature the project had not used.
+- **Not transactional**, unlike `@DataJpaTest`. Rows persist between methods, so every test builds its
+  own accounts with random UUIDs rather than sharing fixtures.
+
+`.contentType(MediaType.APPLICATION_JSON)` is not optional — without it the request is rejected with
+415 Unsupported Media Type.
+
+---
+
+### `api.http` — a runnable request collection
+
+Nine requests at the repo root covering the happy path, the idempotent replay and every error case.
+Works with the **REST Client** extension in Kiro/VS Code, and natively in IntelliJ: a "Send Request"
+link appears above each block.
+
+Chosen over Postman because **it is version-controlled and lives in the repo**. Someone clones the
+project, starts it, and clicks through the entire API without installing anything. Postman
+collections live in someone's account and go stale.
+
+---
+
+### Conceptual questions answered along the way
+
+**Why `accounts` has both `id` and `owner_id`.** `id` answers *which account*; `owner_id` answers
+*whose*, and repeats across every account that person holds. One owner has many accounts because
+**an account holds exactly one currency** (the composite FK makes that permanent), so anyone holding
+both rupees and dollars must have two — plus separate accounts for separate purposes. Collapse the
+two columns and one person could only ever have one account, one currency, one balance. This is also
+why `findByOwnerId` returns a `List`, why V2's `idx_accounts_owner_id` exists, and why
+`ledger_entries.account_id` points at `id` and never at `owner_id` — **money moves between accounts,
+not between people.**
+
+`owner_id` has **no foreign key**, and there is no `users` table. Two readings, both true: identity
+belongs to a separate service and you cannot FK across a database boundary (the normal bounded-context
+pattern), *and* it simply is not modelled yet. Worth deciding deliberately, since an interviewer may
+ask why that one column is unconstrained when everything else is so careful.
+
+**Where `findById` comes from.** Neither derived nor `@Query` — **inherited**. Verified with `javap`:
+
+```
+AccountRepository -> JpaRepository -> ListCrudRepository -> CrudRepository
+```
+
+and `CrudRepository<T, ID>` declares `Optional<T> findById(ID)` along with `save`, `existsById`,
+`count`, `deleteById`. The implementation is a real hand-written class, `SimpleJpaRepository`, whose
+`findById` body is essentially `Optional.ofNullable(entityManager.find(domainClass, id))`.
+
+So one repository interface has **three kinds of method**, routed three different ways by the proxy
+Spring builds at startup:
+
+| kind | example | how it works |
+|---|---|---|
+| inherited | `findById`, `save`, `count` | real implementation in `SimpleJpaRepository` |
+| derived | `findByOwnerId` | no implementation — Spring parses the method **name** at startup |
+| `@Query` | `balanceOf`, `findByIdForUpdate` | you supplied the JPQL |
+
+The generics resolve too: writing `JpaRepository<Account, UUID>` makes the inherited signature
+`Optional<Account> findById(UUID)`, which is why `orElseThrow` yields an `Account`.
+
+---
+
+### Next: Day 11 — Milestone A is three items away
+
+1. **MockMvc tests 2, 3, 4**, using test 1 as the template: unknown account -> 404 with
+   `$.error`; negative amount -> 400 with `$.fields.amountMinor`; `GET .../balance` -> 200 with
+   `$.balanceMinor`. The GET needs `MockMvcRequestBuilders.get` added to the static imports.
+2. **The README** — the file an interviewer reads first. The double-entry model, why there is no
+   balance column, the concurrency story, and how to run it.
+3. *(optional, high value)* **Swagger UI** — add
+   `org.springdoc:springdoc-openapi-starter-webmvc-ui` version **2.9.1** (pin by hand; Boot does not
+   manage springdoc, and the 3.x line targets Boot 4). Gives interactive API docs at
+   `/swagger-ui.html` generated from the controllers, with a working "Try it out". Ten minutes for
+   something an interviewer can click through.
+
+Then **Milestone B**: a container image via `spring-boot:build-image` (no Dockerfile), GitHub Actions
+running the Testcontainers suite, and a deploy.
