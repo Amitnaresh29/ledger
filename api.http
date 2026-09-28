@@ -12,6 +12,26 @@
 
 @host = http://localhost:8080
 
+### Create an account  (expect 201 with a server-generated id)
+POST {{host}}/accounts
+Content-Type: application/json
+
+{
+  "ownerId": "77777777-0000-0000-0000-000000000007",
+  "accountType": "ASSET",
+  "currency": "INR"
+}
+
+### Create an account with an invalid type  (expect 400 naming the field)
+POST {{host}}/accounts
+Content-Type: application/json
+
+{
+  "ownerId": "77777777-0000-0000-0000-000000000007",
+  "accountType": "WALLET",
+  "currency": "INR"
+}
+
 ### Health check
 GET {{host}}/actuator/health
 
